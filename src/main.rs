@@ -30,10 +30,9 @@ async fn main() {
     let mut rx = broker.create_queue("orders");
 
     broker.publish("orders", "订单：001；宫保鸡丁".into()).await;
+    broker.publish("orders", "订单：002；红烧肉".into()).await;
 
     while let Some(msg) = rx.recv().await {
         println!("处理订单：{}", msg);
-
-        break;
     }
 }
