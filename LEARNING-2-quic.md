@@ -5,6 +5,8 @@
 > 现在我们要把它升级成真正的**客户端/服务端架构**：用 **QUIC（HTTP/3 的传输层）** 取代 TCP，用 **Protocol Buffers（protobuf）** 做消息序列化，把 broker 的核心操作（`publish` / `dequeue` / `ack` / `nack` / `subscribe`）暴露成**网络命令**，让远程客户端可以连接进来发布和消费消息。
 >
 > 延续 `LEARNING.md` 的教学方式：**分步引导 + 手动补齐 + 运行验证**，核心逻辑留给你自己写。
+>
+> 🆕 **本阶段相对上一版路线的最大变化**：在正式接触 QUIC 之前，新增了一个「**TCP + 文本协议**」过渡步骤（步骤二）。目的是先把 QUIC 的证书、stream、protobuf 等陌生概念剥离掉，用你最熟悉的字节流跑通「网络 = 包一层 broker 方法」，建立直觉后再上 QUIC。
 
 ---
 
@@ -18,13 +20,15 @@
 - [第 2 章 协议设计：命令与消息的 proto 定义](#第-2-章-协议设计命令与消息的-proto-定义)
 - [第 3 章 分步实现（核心章节）](#第-3-章-分步实现核心章节)
   - [步骤一 添加依赖与工程准备](#步骤一-添加依赖与工程准备)
-  - [步骤二 编写 mq.proto 与代码生成](#步骤二-编写-mqproto-与代码生成)
-  - [步骤三 生成证书（QUIC 强制 TLS）](#步骤三-生成证书quic-强制-tls)
-  - [步骤四 实现 Broker 命令处理层](#步骤四-实现-broker-命令处理层)
-  - [步骤五 实现 quinn 服务端](#步骤五-实现-quinn-服务端)
-  - [步骤六 实现 quinn 客户端](#步骤六-实现-quinn-客户端)
-  - [步骤七 命令行演示工具与联调](#步骤七-命令行演示工具与联调)
+  - [步骤二 TCP 文本协议：先跑通最简网络往返（过渡）](#步骤二-tcp-文本协议先跑通最简网络往返过渡)
+  - [步骤三 编写 mq.proto 与代码生成](#步骤三-编写-mqproto-与代码生成)
+  - [步骤四 生成证书（QUIC 强制 TLS）](#步骤四-生成证书quic-强制-tls)
+  - [步骤五 实现 Broker 命令处理层](#步骤五-实现-broker-命令处理层)
+  - [步骤六 实现 quinn 服务端](#步骤六-实现-quinn-服务端)
+  - [步骤七 实现 quinn 客户端](#步骤七-实现-quinn-客户端)
+  - [步骤八 命令行演示工具与联调](#步骤八-命令行演示工具与联调)
 - [第 4 章 完整扩展路径（更新后的路线地图）](#第-4-章-完整扩展路径更新后的路线地图)
+- [最终工程结构总览（收尾核对）](#最终工程结构总览收尾核对)
 - [附录 依赖版本、证书与调试](#附录-依赖版本证书与调试)
 
 ---
@@ -39,17 +43,19 @@
 
 > ⚠️ **重要提醒**：本阶段我们要把这些**内存里的方法**变成**能通过网络调用的命令**。所以你在 `LEARNING.md` 里实现的方法会原封不动地被复用——只是多了「网络这一层」把它们暴露出去。
 
+> 🕐 **时间与脱困提示**：本阶段预计 **4–5 小时**。每步都标了「建议耗时」；如果某步超过 **1 小时**还没通过验证，先停下来，翻到附录调试技巧，或直接跳到下一步（后面的参考代码会带出前面缺的部分）。QUIC 的 API 细节以你 `cargo doc -p quinn` 看到的为准，卡在某行 API 上时**先查文档而不是硬背**。
+
 **在原有路线图中，本阶段的位置**：
 
 ```mermaid
 flowchart LR
-    S1[✅ 第1阶段 内存版广播订阅+ack<br/>LEARNING.md] --> S2[⭐ 本阶段 QUIC+protobuf 网络化<br/>LEARNING-2-quic.md]
+    S1[✅ 第1阶段 内存版广播订阅+ack<br/>LEARNING.md] --> S2[⭐ 本阶段 QUIC+protobuf 网络化<br/>LEARNING-2-quic.md<br/>含 TCP 文本协议过渡]
     S2 --> S3[第3阶段 持久化<br/>文件与I/O]
     S3 --> S4[第4阶段 topic路由<br/>RabbitMQ概念]
     S4 --> S5[第5阶段 HTTP管理接口]
 ```
 
-> 原计划的「第 2 阶段 TCP 服务化」**升级为本阶段的「QUIC + protobuf 网络化」**。QUIC 与 TCP 的传输层职责相同，但 QUIC 是 HTTP/3 的基础、自带 TLS 加密与多路复用，更现代。
+> 原计划的「第 2 阶段 TCP 服务化」**升级为本阶段的「QUIC + protobuf 网络化」**。QUIC 与 TCP 的传输层职责相同，但 QUIC 是 HTTP/3 的基础、自带 TLS 加密与多路复用，更现代。同时我们保留了一个「TCP + 文本协议」过渡步骤，让你在迈入 QUIC 前先用最熟悉的方式把「网络层」跑通。
 
 ---
 
@@ -211,9 +217,12 @@ message Response {
 ## 第 3 章 分步实现（核心章节）
 
 > ⚠️ **约定**：本章会指导你**新建**多个文件，不再只改 `main.rs`：
+> - `src/lib.rs` —— 库入口（从本阶段起，broker 和 proto 都以库模块方式供所有 bin 复用）
 > - `proto/mq.proto` —— 协议定义
 > - `build.rs` —— prost 代码生成
 > - `src/broker.rs` —— 把内存版 broker 抽出来（复用 LEARNING.md 的成果）
+> - `src/bin/tcp_server.rs` / `src/bin/tcp_client.rs` —— 步骤二过渡用的 TCP 版本（跑通后可删）
+> - `src/bin/gen_cert.rs` —— 证书生成
 > - `src/bin/server.rs` —— quinn 服务端
 > - `src/bin/client.rs` —— quinn 客户端（命令行工具）
 >
@@ -223,7 +232,9 @@ message Response {
 
 ### 步骤一 添加依赖与工程准备
 
-**本步目标**：给 `Cargo.toml` 加上 QUIC、protobuf、证书生成的依赖，并把内存版 broker 抽到独立模块。
+> ⏱ **建议耗时**：30–40 分钟
+
+**本步目标**：给 `Cargo.toml` 加上 QUIC、protobuf、证书生成的依赖，把内存版 broker 抽到独立模块，并引入 `lib` 目标，让后续所有 bin 都能复用。
 
 **概念讲解**：
 
@@ -235,13 +246,17 @@ message Response {
 | `prost` | protobuf 编解码 API | `[dependencies]` |
 | `prost-build` | 从 `.proto` 生成代码 | `[build-dependencies]` |
 | `rcgen` | 生成本地自签名 TLS 证书 | `[dependencies]` |
-| `tokio` | 异步运行时（已有） | `[dependencies]` |
+| `tokio` | 异步运行时（已有，需补 feature） | `[dependencies]` |
+| `anyhow` / `bytes` | 错误简化 / 缓冲（可选但推荐） | `[dependencies]` |
 
-**实现提示**：编辑 `Cargo.toml`，追加：
+> 📖 **为什么项目要从「单 main.rs」变成「库 + 多个可执行文件」**？因为我们要有 `server`、`client`、`gen_cert`、`tcp_server` 等多个程序，而它们都要引用同一个 `Broker`。把 `Broker` 放进库（`lib.rs`），所有 bin 都能 `use mymq::broker::Broker;`，这是 Rust 多程序工程的标准布局。
+
+**实现提示**：编辑 `Cargo.toml`：
 
 ```toml
 [dependencies]
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time"] }
+# 注意：比 LEARNING.md 多了 "net" 和 "io-util"（步骤二 TCP 用）、"time"（LEARNING.md 步骤七就已需要）
 quinn = "0.11"
 prost = "0.13"
 rcgen = "0.13"
@@ -250,6 +265,9 @@ bytes = "1"           # quinn 流读写用 Bytes 缓冲（quinn 依赖它，方�
 
 [build-dependencies]
 prost-build = "0.13"
+
+[lib]
+name = "mymq"         # 库名设为简短的 mymq，bin 里 use mymq::broker::Broker;
 ```
 
 > ⚠️ **版本提示**：quinn / prost / rcgen 的版本号请以**你执行 `cargo add` 时的最新版本为准**。上面是示例。建议直接在项目根目录运行：
@@ -257,20 +275,153 @@ prost-build = "0.13"
 > cargo add quinn prost rcgen anyhow bytes
 > cargo add --build prost-build
 > ```
-> 让 cargo 自动挑选当前可用版本，避免手写版本号过期。
+> 让 cargo 自动挑选当前可用版本，避免手写版本号过期。注意 `cargo add` **不会**自动补 `tokio` 的 `net`/`io-util` feature 和 `[lib] name`，这两处需要手动改。
 
-**工程结构调整**：把 `LEARNING.md` 里你写好的 broker 逻辑抽到 `src/broker.rs`，然后在 `src/main.rs` 里 `mod broker;`。这样服务端、客户端、未来的模块都能 `use broker::Broker;`。
+**工程结构调整**（把「单文件 demo」升级为「库 + 多 bin」）：
+
+1. 新建 `src/lib.rs`，内容：`pub mod broker;`（步骤三做完后还会加一行 `pub mod proto;`）——这是库入口
+2. 把你在 `LEARNING.md` 中实现的 `Broker` 及相关结构（`Message`/`Topic`/`SubscriberState`）整体移动到新文件 `src/broker.rs`
+3. 给所有类型和方法加 `pub`（`pub struct Broker`、`pub fn ...`），**`Message` 的 `id`/`body` 字段也要 `pub`**（网络层要读它们）
+4. `src/main.rs` 顶部改为 `use mymq::broker::Broker;`，删掉原来重复的结构定义；`main.rs` 里的 `wait_for_message` / `subscriber` / `redelivery_worker` 等 demo 函数可以保留
 
 **请你动手**：
-1. 运行上面的 `cargo add` 命令
-2. 把你在 `LEARNING.md` 中实现的 `Broker` 及相关结构（`Message`/`Topic`/`SubscriberState`）整体移动到新文件 `src/broker.rs`，并把 `pub` 关键字加上（`pub struct Broker`、`pub fn ...`）
-3. 在 `src/main.rs` 顶部写 `mod broker;` 让它能引用
+1. 运行上面的 `cargo add` 命令，并按提示手动补 `tokio` feature 和 `[lib] name`
+2. 完成上面的 4 步工程调整
 
-**验证方式**：`cargo check` 通过。此时你可能要处理 `mod broker` 的可见性报错——把需要外部访问的类型/方法都标上 `pub`。
+**验证方式**：`cargo check` 通过。此时你可能要处理可见性报错——把需要外部访问的类型/方法都标上 `pub`。`cargo run` 会跑 `main.rs` 里的内存版 demo，能跑说明抽模块没抽坏。
 
 ---
 
-### 步骤二 编写 mq.proto 与代码生成
+### 步骤二 TCP 文本协议：先跑通最简网络往返（过渡）
+
+> ⏱ **建议耗时**：40–50 分钟
+
+**本步目标**：不上 QUIC、不上 protobuf，用最熟悉的 TCP + 文本行，把 `publish` / `dequeue` / `ack` / `nack` 暴露成网络命令，跑通「网络 = 包一层 broker 方法」。
+
+**概念讲解**：
+
+为什么先做这一步？因为 QUIC 的证书、stream、连接模型和 protobuf 的生成管线是**好几个互相依赖的陌生概念**，一起涌进来会让人寸步难行。先把它们剥掉，只保留网络编程最核心的东西：
+
+> **网络层的工作本质**：读入请求 → 翻译成 broker 方法调用 → 把结果写回。
+
+另外一个关键问题会在这步**提前登场**：TCP 是**字节流**，没有消息边界——服务端怎么知道「一条命令到哪结束」？最简单的答案：**每条命令一行，用换行符 `\n` 划界**。这就是「帧边界」问题的最小解法，也是后来 QUIC 能帮你省掉的那件事（stream 自带边界）。
+
+**实现提示**：
+
+1. 服务端 `src/bin/tcp_server.rs`（完整参考，重点看帧处理）：
+
+```rust
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex;
+use mymq::broker::Broker;
+
+async fn handle_conn(stream: TcpStream, broker: Arc<Mutex<Broker>>) -> anyhow::Result<()> {
+    let (read_half, mut write_half) = stream.split();
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        // 一条命令 = 一行（以 \n 结尾）。读到 0 字节说明对端关闭了连接。
+        if reader.read_line(&mut line).await? == 0 {
+            break;
+        }
+        let parts: Vec<&str> = line.trim().split_whitespace().collect();
+        if parts.len() < 3 {
+            // 教学简化：参数不够直接返回 ERR（真实代码应逐个命令校验）
+            write_half.write_all(b"ERR need more args\n").await?;
+            continue;
+        }
+        let mut b = broker.lock().await;
+        let resp = match parts[0] {
+            "SUBSCRIBE" => {
+                b.subscribe(parts[1], parts[2]);
+                "OK\n".to_string()
+            }
+            "PUBLISH" => {
+                let id = b.publish(parts[1], parts[2..].join(" "));
+                format!("OK {id}\n")
+            }
+            "DEQUEUE" => match b.dequeue(parts[1], parts[2]) {
+                Some(msg) => format!("MSG {} {}\n", msg.id, msg.body),
+                None => "EMPTY\n".to_string(),
+            },
+            "ACK" | "NACK" => {
+                let ok = if parts[0] == "ACK" {
+                    b.ack(parts[1], parts[2], parts[3].parse().unwrap_or(0))
+                } else {
+                    b.nack(parts[1], parts[2], parts[3].parse().unwrap_or(0))
+                };
+                if ok { "OK\n".to_string() } else { "FAIL\n".to_string() }
+            }
+            _ => "ERR unknown command\n".to_string(),
+        };
+        write_half.write_all(resp.as_bytes()).await?;
+    }
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let broker = Arc::new(Mutex::new(Broker::new()));
+    let listener = TcpListener::bind("127.0.0.1:7777").await?;
+    println!("TCP 服务端已启动，监听 127.0.0.1:7777");
+    loop {
+        let (stream, _) = listener.accept().await?;
+        let broker = Arc::clone(&broker);
+        tokio::spawn(async move {
+            if let Err(e) = handle_conn(stream, broker).await {
+                eprintln!("连接处理出错: {e}");
+            }
+        });
+    }
+}
+```
+
+2. 客户端 `src/bin/tcp_client.rs`（发一条命令，打印响应）：
+
+```rust
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::TcpStream;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().collect();
+    let cmd = args[1..].join(" "); // 例：PUBLISH orders order-001
+    let mut stream = TcpStream::connect("127.0.0.1:7777").await?;
+    stream.write_all((cmd + "\n").as_bytes()).await?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).await?;
+    print!("{}", line.trim());
+    Ok(())
+}
+```
+
+> ⚠️ **Windows 提示**：PowerShell 里 `cargo run` 传中文参数可能有编码问题，测试时先用 ASCII 内容（如 `order-001`）跑通，再试中文。
+
+**请你动手**：把两个文件建出来，跑通下面的验证。然后思考两个问题：
+
+1. 为什么每条响应都加 `\n`？如果把服务端的 `read_line` 换成一次性 `read`，会发生什么？（提示：你不知道客户端一次会发多长——这就是「帧边界」必须自己定的原因。）
+2. 这个「行」协议有什么缺陷？如果消息 body 里恰好包含换行符怎么办？（真实 MQ 都会遇到这个问题，第 3 阶段持久化时你还会再遇到它。）
+
+**验证方式**：
+
+1. 终端1：`cargo run --bin tcp_server`
+2. 终端2：`cargo run --bin tcp_client -- SUBSCRIBE orders 推送组`
+3. 终端3：`cargo run --bin tcp_client -- PUBLISH orders order-001`
+4. 终端2：`cargo run --bin tcp_client -- DEQUEUE orders 推送组` → 应打印 `MSG 1 order-001`
+5. 再试 `ACK orders 推送组 1`，然后重复 `DEQUEUE`（应打印 `EMPTY`）
+6. 开第二个订阅者 `SUBSCRIBE orders 库存组`，再 PUBLISH 一条，两个订阅者各自 `DEQUEUE`——**都能拿到同一条消息，广播在网络上也成立**
+
+> 跑通这步后，你已经掌握「字节流帧边界 + 命令分发 + 共享 broker」三件事。接下来 QUIC 只是把「行协议 + TCP」换成「protobuf + stream」，思维模型完全不变。这个过渡版本的代码跑通后可以留着对比，也可以删掉。
+
+---
+
+### 步骤三 编写 mq.proto 与代码生成
+
+> ⏱ **建议耗时**：30–40 分钟
 
 **本步目标**：写好 `proto/mq.proto`（第 2 章的内容），配置 `build.rs` 自动生成 Rust 代码，并验证生成成功。
 
@@ -297,7 +448,7 @@ fn main() {
 }
 ```
 
-3. 在你需要用到协议类型的地方（比如新模块 `src/proto.rs`），引入生成代码：
+3. 创建 `src/proto.rs`，把生成代码封装成一个模块：
 
 ```rust
 pub mod mq {
@@ -305,18 +456,23 @@ pub mod mq {
 }
 ```
 
-**请你动手**：创建 `proto/mq.proto` 和 `build.rs`，把生成代码封装进 `src/proto.rs`。
+4. 在 `src/lib.rs` 里补上 `pub mod proto;`（此时 lib.rs 应有 `pub mod broker;` 和 `pub mod proto;` 两行）。
+
+**请你动手**：创建 `proto/mq.proto` 和 `build.rs`、`src/proto.rs`，并更新 `src/lib.rs`。
 
 **验证方式**：
+
 1. `cargo build` 能通过（prost 会在编译期生成代码）
-2. 在 `src/proto.rs` 里临时写个测试：`let _ = mq::Command { cmd: None };` 确认类型可用
+2. 在 `src/proto.rs` 里临时写个测试：`let _ = mq::Command::default();` 确认类型可用（prost 生成的类型都实现了 `Default`）
 3. 想确认生成成功，可以查看 `target/.../build/mymq-rs-*/out/mq.rs`（`cargo build` 后 `OUT_DIR` 下的文件）
 
-> 📖 **注意**：`mq::Command` 里没有 `Default`？prost 生成的消息都实现了 `Default` 和 `PartialEq`，所以 `Command::default()` 可用。但 oneof 字段初始为 `None`。
+> 📖 **注意**：`mq::Command` 里的 oneof 字段初始为 `None`，用 `Command::default()` 即可得到全空实例。
 
 ---
 
-### 步骤三 生成证书（QUIC 强制 TLS）
+### 步骤四 生成证书（QUIC 强制 TLS）
+
+> ⏱ **建议耗时**：15–20 分钟
 
 **本步目标**：用 `rcgen` 生成本地自签名证书，供 QUIC 服务端使用（QUIC 内建 TLS，必须有证书）。
 
@@ -356,7 +512,9 @@ fn main() -> anyhow::Result<()> {
 
 ---
 
-### 步骤四 实现 Broker 命令处理层
+### 步骤五 实现 Broker 命令处理层
+
+> ⏱ **建议耗时**：30–40 分钟
 
 **本步目标**：在 `src/broker.rs` 的 `Broker` 上新增一个「命令处理」方法，接收一个 `Command`，返回 `Response`，把网络层和业务层解耦。
 
@@ -386,15 +544,17 @@ pub fn handle_command(&mut self, cmd: mq::Command) -> mq::Response {
 - **DEQUEUE**：调用 `self.dequeue(&d.topic, &d.subscriber)`，得到 `Option<Message>`。有则放进 `Response.message`，无则 `ok: true` 且 message 为空（表示暂时没消息）
 - **ACK / NACK**：调用对应方法，根据返回的 `bool` 设置 `ok`
 
-注意：你的 `Broker` 需要 `use` 一下 proto 类型。在 `src/broker.rs` 顶部加 `use crate::proto::mq;`（如果你的 proto 模块放在 `crate::proto`）。
+注意：你的 `Broker` 需要 `use` 一下 proto 类型。在 `src/broker.rs` 顶部加 `use crate::proto::mq::{self, Response};`（`crate` 在这里指 lib，因为 broker.rs 是 lib 的模块），这样函数签名里写 `mq::Command` / `mq::Response`，函数体内写 `Response` 都成立。
 
 **请你动手**：给 `Broker` 加 `handle_command` 方法，完成 5 种命令的翻译。思考：`dequeue` 返回空时，怎么在 `Response` 里表达「没消息」而不是「出错」？
 
-**验证方式**：`cargo check` 通过。可写临时测试：构造一个 `Publish` 命令，调用 `handle_command`，检查返回的 `msg_id > 0`。
+**验证方式**：`cargo check` 通过。可以写一个单元测试：构造一个 `Publish` 命令，调用 `handle_command`，检查返回的 `msg_id > 0`。把测试加在 `src/broker.rs` 末尾的 `#[cfg(test)] mod tests` 里，运行 `cargo test`。
 
 ---
 
-### 步骤五 实现 quinn 服务端
+### 步骤六 实现 quinn 服务端
+
+> ⏱ **建议耗时**：45–60 分钟
 
 **本步目标**：创建 `src/bin/server.rs`，启动 quinn 服务端，监听 UDP 端口，为每个入站 stream 派一个 task，处理并响应命令。
 
@@ -418,7 +578,12 @@ flowchart TD
     S2 --> B
 ```
 
-**实现提示**（服务端骨架）：
+> ⚠️ **先理解请求/响应的帧约定，再动手写代码**：
+> - 一条命令 = 客户端开的一条双向流；命令字节写在流的发送半部，响应从同一流的接收半部读回。
+> - 服务端用 `recv.read_to_end(...)` 读到「流关闭」为止——所以**客户端写完请求后必须 `send.finish()` 关闭发送半部**，服务端才知道这条命令读完了。
+> - 这一步你只需要按这个约定写服务端；客户端在步骤七实现时，记得写完后调用 `finish()`。这是新手最容易踩的坑：忘了 `finish()`，两边都会一直干等。
+
+**实现提示**（服务端骨架 + 完整 `load_cert`）：
 
 ```rust
 use std::sync::Arc;
@@ -427,12 +592,23 @@ use tokio::sync::Mutex;
 use mymq::proto::mq;
 use mymq::broker::Broker;
 
+/// 读取本地生成的证书文件，构造 TLS 配置所需的类型
+fn load_cert() -> anyhow::Result<(
+    Vec<quinn::rustls::pki_types::CertificateDer<'static>>,
+    quinn::rustls::pki_types::PrivateKeyDer<'static>,
+)> {
+    use quinn::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
+    let cert = CertificateDer::from(std::fs::read("cert.der")?);
+    let key = PrivateKeyDer::from(PrivatePkcs8KeyDer::from(std::fs::read("key.der")?));
+    Ok((vec![cert], key))
+}
+
 async fn handle_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     broker: Arc<Mutex<Broker>>,
 ) -> anyhow::Result<()> {
-    // 1. 读取请求（一条命令 = 一段字节流）
+    // 1. 读取请求（一条命令 = 一段字节流；读到流关闭为止，所以客户端必须 finish()）
     let data = recv.read_to_end(64 * 1024).await?;
     let cmd: mq::Command = prost::Message::decode(&*data)?;
 
@@ -477,18 +653,21 @@ async fn main() -> anyhow::Result<()> {
 
 > 📖 **要点**：
 > - `prost::Message` trait 提供了 `decode`（字节→对象）和 `encode_to_vec`（对象→字节）两个核心方法
-> - `read_to_end` 会读到流关闭为止——所以**客户端必须在写完后关闭发送半部**（见步骤六），服务端才能知道「数据结束了」
+> - `read_to_end` 会读到流关闭为止——所以客户端必须在写完请求后关闭发送半部（`send.finish()`，见步骤七），服务端才能知道「这条命令读完了」
+> - `with_single_cert` 的第一个参数是证书链 `Vec<CertificateDer>`；不同 quinn 版本的签名可能有细微差别，以你 `cargo doc -p quinn` 看到的为准
 > - 每个连接派一个 task，每条流再派一个 task，充分利用 tokio 并发
 
-**请你动手**：创建 `src/bin/server.rs`，补全 `load_cert()`（用 `quinn::rustls::pki_types` 从 `cert.der`/`key.der` 构造 `CertificateDer` / `PrivateKeyDer`）。
+**请你动手**：创建 `src/bin/server.rs`，把上面的骨架补全（`load_cert` 已给出，可以直接用）。
 
 **验证方式**：`cargo build` 通过。运行 `cargo run --bin server`，应看到「服务端已启动」。此时还没有客户端连它，会一直等待——正常。
 
-> 💡 **提示**：quinn 的证书加载 API 涉及 `rustls::pki_types::CertificateDer`。如果你卡住，用 `cargo doc -p quinn` 查看示例，或搜索 `quinn ServerConfig with_single_cert`。
+> 💡 **提示**：如果证书加载 API 和你装的 quinn 版本对不上，用 `cargo doc -p quinn` 查看示例，或搜索 `quinn ServerConfig with_single_cert`。
 
 ---
 
-### 步骤六 实现 quinn 客户端
+### 步骤七 实现 quinn 客户端
+
+> ⏱ **建议耗时**：45–60 分钟
 
 **本步目标**：创建 `src/bin/client.rs`，用 `quinn` 连接服务端，发送命令、接收响应，并暴露成简单的命令行参数用法。
 
@@ -501,21 +680,32 @@ quinn 客户端流程（与 TCP connect 对称，但**必须配置证书信任**
 3. `endpoint.connect(server_name, addr)` 建立连接
 4. `conn.open_bi()` 开一条双向流，写命令、读响应
 
-**实现提示**（客户端骨架）：
+**实现提示**（客户端骨架 + 完整证书信任配置）：
 
 ```rust
+use std::sync::Arc;
 use quinn::{ClientConfig, Endpoint};
 use mymq::proto::mq;
+
+/// 信任我们自签的证书（仅本地学习；生产环境应由可信 CA 签发）
+fn client_config() -> anyhow::Result<quinn::ClientConfig> {
+    use quinn::rustls::pki_types::CertificateDer;
+    use quinn::rustls::RootCertStore;
+    let mut roots = RootCertStore::empty();
+    roots.add(CertificateDer::from(std::fs::read("cert.der")?))?;
+    Ok(quinn::ClientConfig::with_root_certificates(Arc::new(roots))?)
+}
 
 async fn send_command(conn: &quinn::Connection, cmd: mq::Command) -> anyhow::Result<mq::Response> {
     // 1. 打开双向流
     let (mut send, mut recv) = conn.open_bi().await?;
-    // 2. 编码命令并写入，然后关闭发送半部（关键！）
+    // 2. 编码命令并写入
     let buf = prost::Message::encode_to_vec(&cmd);
     send.write_all(&buf).await?;
-    send.finish().await?;   // 告诉对端：数据结束了
+    // 3. 关闭发送半部（关键！服务端靠流关闭判定命令结束，漏掉它会永远等不到响应）
+    send.finish().await?;
 
-    // 3. 读取响应
+    // 4. 读取响应
     let data = recv.read_to_end(64 * 1024).await?;
     Ok(prost::Message::decode(&*data)?)
 }
@@ -537,9 +727,9 @@ match args[1].as_str() {
 }
 ```
 
-**请你动手**：创建 `src/bin/client.rs`，实现 `send_command` 和基于命令行参数的命令分发。需要自己处理「信任自签名证书」的配置（`ClientConfig` 里注入自定义根证书）。
+> 📖 **模块路径**：因为 `lib.rs` 里声明了 `pub mod broker; pub mod proto;`，而 `proto.rs` 里是 `pub mod mq { include!(...) }`，所以完整类型路径是 `mymq::proto::mq::Command`。bin 文件顶部 `use mymq::proto::mq;` 后即可直接用 `mq::Command`。
 
-**验证方式**：先启动服务端，再开另一个终端运行客户端命令。构造 `Command` 的代码里，oneof 赋值方式形如：
+**请你动手**：创建 `src/bin/client.rs`，实现 `client_config`、`send_command` 和基于命令行参数的命令分发。构造 `Command` 的 oneof 赋值方式形如：
 
 ```rust
 mq::Command {
@@ -552,9 +742,13 @@ mq::Command {
 
 > 📖 **注意**：`Command` 的 oneof 字段在生成代码里叫 `cmd`，类型是 `Option<mq::command::Cmd>`。prost 会把 `.proto` 里 oneof 的名称 `cmd` 变成字段名，枚举名叫 `command::Cmd`。
 
+**验证方式**：先启动服务端（终端1），再开另一个终端运行客户端命令。对照「帧约定」复习一下：**客户端写完请求必须 `send.finish()`**，否则服务端 `read_to_end` 永远等不到数据结束。
+
 ---
 
-### 步骤七 命令行演示工具与联调
+### 步骤八 命令行演示工具与联调
+
+> ⏱ **建议耗时**：30–40 分钟
 
 **本步目标**：写一个综合演示脚本/说明，用多个客户端模拟「广播订阅」效果，验证跨网络的多订阅者隔离仍然成立。
 
@@ -577,7 +771,7 @@ flowchart LR
 
 **实现提示**：为了让演示可重复、结果可观察，建议：
 
-1. 在 `client` 里加一个 `subscribe` 命令（步骤六已具备）
+1. 在 `client` 里加一个 `subscribe` 命令（步骤七已具备）
 2. 写一份 `演示脚本.md` 或直接在文档说明操作顺序：
    - 终端1：`cargo run --bin server`
    - 终端2：`cargo run --bin client -- subscribe orders 推送组`
@@ -602,7 +796,7 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    S1[✅ 第1阶段 内存版广播订阅<br/>LEARNING.md] --> S2[✅ 本阶段 QUIC+protobuf 网络化<br/>LEARNING-2-quic.md]
+    S1[✅ 第1阶段 内存版广播订阅<br/>LEARNING.md] --> S2[✅ 本阶段 QUIC+protobuf 网络化<br/>LEARNING-2-quic.md<br/>含 TCP 文本协议过渡]
     S2 --> S3[第3阶段 持久化<br/>文件与I/O]
     S3 --> S4[第4阶段 topic路由<br/>RabbitMQ概念]
     S4 --> S5[第5阶段 HTTP管理接口]
@@ -612,7 +806,7 @@ flowchart LR
 | 阶段 | 做什么 | 关键知识点 | 前置依赖 |
 |------|--------|-----------|---------|
 | **第 1 阶段 ✅** | 内存版广播订阅 + ack + 超时重投 | `Arc`/`Mutex`/`Notify`、状态机 | 无 |
-| **第 2 阶段 ✅** | **QUIC + protobuf 网络化** | `quinn`、`prost`、TLS 证书、自定义协议 | 第 1 阶段 |
+| **第 2 阶段 ✅** | **QUIC + protobuf 网络化**（含 TCP 文本协议过渡） | `quinn`、`prost`、TLS 证书、自定义协议、帧边界 | 第 1 阶段 |
 | **第 3 阶段：持久化** | 消息 append-log 追加写磁盘、启动恢复 | `std::fs`、文件追加写、崩溃一致性 | 第 2 阶段 |
 | **第 4 阶段：topic 路由** | exchange + routing key 绑定，按规则路由 | 路由表、binding key、多 exchange 类型 | 第 2 阶段 |
 | **第 5 阶段：HTTP 管理接口** | 用 `axum` 提供 REST API 查询/管理 | `axum`、JSON、HTTP 路由 | 第 2 阶段 |
@@ -643,6 +837,46 @@ flowchart LR
 
 ---
 
+## 最终工程结构总览（收尾核对）
+
+整个第 2 阶段做完后，你的工程应该是这样的结构。拿它核对一遍，缺哪个文件回去补：
+
+```text
+Mymq-rs/
+├── Cargo.toml            # 含 [lib] name = "mymq"
+├── build.rs              # prost 代码生成
+├── proto/
+│   └── mq.proto          # 协议定义（唯一真相）
+├── cert.der / key.der    # 本地自签名证书（勿提交 git）
+├── src/
+│   ├── lib.rs            # 库入口：pub mod broker; pub mod proto;
+│   ├── broker.rs         # 第 1 阶段的内存版 Broker（pub 化后复用）
+│   ├── proto.rs          # include! 封装 prost 生成代码
+│   ├── main.rs           # 可留作第 1 阶段的 demo，也可删掉
+│   └── bin/
+│       ├── tcp_server.rs # 步骤二过渡产物（可选，可删）
+│       ├── tcp_client.rs # 步骤二过渡产物（可选，可删）
+│       ├── gen_cert.rs   # 生成证书
+│       ├── server.rs     # quinn 服务端
+│       └── client.rs     # quinn 客户端（命令行工具）
+```
+
+各文件职责一览：
+
+| 文件 | 职责 | 你会在这看到 |
+|------|------|------------|
+| `proto/mq.proto` | 协议「唯一真相」 | `Command` / `Response` / `Message` |
+| `build.rs` | 编译期生成 Rust 代码 | `prost_build::compile_protos` |
+| `src/lib.rs` | 库入口，对外暴露模块 | `pub mod broker;` `pub mod proto;` |
+| `src/broker.rs` | 纯业务逻辑（不碰网络） | `Broker` 全部方法 + `handle_command` + 测试 |
+| `src/proto.rs` | 封装生成代码 | `include!` + `pub mod mq` |
+| `src/bin/server.rs` | 网络入口：QUIC + 命令分发 | `quinn` + `handle_stream` |
+| `src/bin/client.rs` | 命令行客户端 | 构造 `Command` → `send_command` |
+
+> 📖 **架构收获**：这就是「**业务层 / 协议层 / 网络层**」三层分离的典型结构——`broker.rs` 只懂业务，`proto.rs` 只懂序列化，`server.rs` 只懂传输。每层各改各的，互不干扰。
+
+---
+
 ## 附录 依赖版本、证书与调试
 
 ### 依赖安装命令
@@ -653,6 +887,8 @@ cargo add quinn prost rcgen anyhow bytes
 # 添加构建期依赖（代码生成）
 cargo add --build prost-build
 ```
+
+> 别忘了手动补：`tokio` 的 `net` / `io-util` / `time` features，以及 `[lib] name = "mymq"`。
 
 ### 证书命令
 
@@ -667,7 +903,12 @@ ls cert.der key.der
 ### 运行命令
 
 ```bash
-# 启动服务端（监听 127.0.0.1:8443）
+# 步骤二过渡（TCP 文本协议版，可选）：
+cargo run --bin tcp_server
+cargo run --bin tcp_client -- SUBSCRIBE orders 推送组
+cargo run --bin tcp_client -- PUBLISH orders order-001
+
+# 启动 quinn 服务端（监听 127.0.0.1:8443）
 cargo run --bin server
 
 # 客户端命令示例（另开终端）
@@ -680,11 +921,12 @@ cargo run --bin client -- nack orders 库存组 2
 
 ### 调试技巧
 
-1. **「读不到响应」**：多半是没 `send.finish()`。服务端靠流的关闭来知道数据结束，客户端写完后必须 `finish()`（见步骤六）。
-2. **证书报错 / 握手失败**：确认服务端用 `ServerConfig::with_single_cert`，客户端配置里信任了同一张证书。自签名证书两边都要正确加载。
+1. **「读不到响应」**：多半是没 `send.finish()`。服务端靠流的关闭来知道数据结束，客户端写完后必须 `finish()`（见步骤七）。
+2. **证书报错 / 握手失败**：确认服务端用 `ServerConfig::with_single_cert`，客户端 `client_config` 里信任了同一张证书（`cert.der`）。自签名证书两边都要正确加载。
 3. **想让 quinn 打日志**：`RUST_LOG=debug cargo run --bin server`，配合 `env_logger` 或 `tracing-subscriber` 初始化。
 4. **想确认生成的 proto 代码**：`cargo build` 后，在 `target/debug/build/mymq-rs-*/out/` 下找 `mq.rs`，看生成的消息结构（尤其 oneof 的枚举名）。
 5. **命令对不上**：`Command` 的 oneof 字段名在生成代码里叫 `cmd`，构造时用 `mq::command::Cmd::Xxx(...)`，别写成别的名字。
+6. **TCP 过渡跑不通**：确认 `tokio` 开了 `net` / `io-util` features；客户端忘了在命令后加 `\n` 也会让服务端永远读不到完整一行。
 
 ### .gitignore 建议追加
 

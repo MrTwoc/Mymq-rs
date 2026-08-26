@@ -77,7 +77,8 @@ async fn main() {
 
 ```toml
 [dependencies]
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+# 注：步骤七用到了 tokio::time::sleep，因此需要 "time" 特性
 ```
 
 ### 它现在能做什么？
@@ -165,11 +166,13 @@ flowchart TD
 
 > ⚠️ **重要约定**：本章每一步都要**修改 `src/main.rs`**。为了让你真正学会，代码只给**必要的骨架**，核心逻辑留给你自己补。每步之间可以独立编译，但最好按顺序做，因为结构是层层叠加的。
 >
+> 🕐 **时间与脱困提示**：核心 7 步预计 **3–4 小时**。每步都标了「建议耗时」；如果某步超过 **1 小时**还没通过验证，说明卡在某个概念上——先停下来，翻到附录的调试技巧，或直接跳到下一步（后面的参考代码会带出前面缺的部分），回头再来补。**卡住本身是学习的一部分，别硬扛。**
+>
 > 开始前，先明确最终的数据结构蓝图，你每写一步都往这个方向靠：
 
 ```mermaid
 flowchart TD
-    B[Broker<br/>topics: HashMap<String, Topic><br/>next_id: u64<br/>notifier: Notify] --> T[Topic: orders<br/>subscribers: HashMap<String, SubscriberState>]
+    B[Broker<br/>topics: HashMap<String, Topic><br/>next_id: u64<br/>notifier: Arc&lt;Notify&gt;] --> T[Topic: orders<br/>subscribers: HashMap<String, SubscriberState>]
     T --> S1[订阅者: 订单推送<br/>pending + inflight]
     T --> S2[订阅者: 库存扣减<br/>pending + inflight]
     T --> S3[订阅者: 报表分析<br/>pending + inflight]
@@ -180,6 +183,8 @@ flowchart TD
 ---
 
 ### 步骤一 消息模型：给消息一个身份
+
+> ⏱ **建议耗时**：20–30 分钟
 
 **本步目标**：把「裸字符串」升级为「带 ID 的消息」。
 
@@ -220,6 +225,8 @@ struct Broker {
 ---
 
 ### 步骤二 订阅者状态：pending 与 inflight
+
+> ⏱ **建议耗时**：20–30 分钟
 
 **本步目标**：定义「一个订阅者自己的消息状态」。
 
@@ -271,6 +278,8 @@ impl SubscriberState {
 
 ### 步骤三 Topic 与订阅注册
 
+> ⏱ **建议耗时**：25–35 分钟
+
 **本步目标**：用 `Topic` 把「多个订阅者」组织起来，并实现 `subscribe`。
 
 **概念讲解**：
@@ -304,7 +313,8 @@ impl Topic {
 struct Broker {
     topics: std::collections::HashMap<String, Topic>,
     next_id: u64,
-    notifier: tokio::sync::Notify, // 稍后在步骤七用到，先留占位
+    // 用 Arc<Notify> 而不是 Notify：步骤七要让订阅者在「不占锁」的情况下等待通知
+    notifier: std::sync::Arc<tokio::sync::Notify>, // 稍后在步骤七用到，先留占位
 }
 ```
 
@@ -324,13 +334,15 @@ fn subscribe(&mut self, topic: &str, subscriber: &str) {
 
 > 📖 **知识点**：`HashMap::entry(...).or_insert_with(...)` 是「有则复用、无则创建」的惯用法。如果你不熟悉，花 5 分钟查一下 `entry` API，这是 Rust 常用模式。
 
-**请你动手**：补全 `Topic` 结构、改造 `Broker` 字段、实现 `subscribe`。
+**请你动手**：补全 `Topic` 结构、改造 `Broker` 字段、实现 `subscribe`。别忘了在 `new()` 里把 `notifier` 初始化为 `Arc::new(tokio::sync::Notify::new())`，并在文件顶部 `use std::sync::Arc;`。
 
 **验证方式**：`cargo build` 通过（此时原来的 `publish`/`create_queue` 方法已因字段改名而报错，**不要修**，下一步会重写它们）。
 
 ---
 
 ### 步骤四 发布广播：复制并分发
+
+> ⏱ **建议耗时**：20–30 分钟
 
 **本步目标**：实现 `publish`，把一条消息**复制**推给该 topic 的**每个订阅者**。
 
@@ -359,18 +371,24 @@ fn publish(&mut self, topic: &str, body: String) -> u64 {
         for sub in t.subscribers.values_mut() {
             sub.pending.push_back(msg.clone()); // 复制给每个订阅者
         }
+        // 唤醒所有正在等待的订阅者。
+        // 注意是 notify_waiters 而不是 notify_one：广播场景有多个订阅者同时在等，
+        // 只唤醒一个，其余订阅者就永远等下去了。
+        self.notifier.notify_waiters();
     }
     id
 }
 ```
 
-**请你动手**：完成 `publish`。思考：如果 topic 不存在会怎样？（提示：`get_mut` 返回 `None` 则什么都不做——所以发布前应先 `subscribe`。）
+**请你动手**：完成 `publish`。思考：如果 topic 不存在会怎样？（提示：`get_mut` 返回 `None` 则什么都不做——所以发布前应先 `subscribe`。）再思考：为什么这里用 `notify_waiters()` 而不是 `notify_one()`？（提示：3 个订阅者同时在等，只唤醒 1 个，另外 2 个就永远等下去了。）
 
 **验证方式**：`cargo build` 通过。现在可以临时写几行测试，手动建一个 topic、注册 2 个订阅者、发布 1 条消息，打印各自的 `pending.len()`，应都是 1。
 
 ---
 
 ### 步骤五 拉取与确认：dequeue / ack / nack
+
+> ⏱ **建议耗时**：35–45 分钟
 
 **本步目标**：实现消费的三大操作，并体会「**ack 只影响订阅者自己**」。
 
@@ -428,11 +446,44 @@ fn nack(&mut self, topic: &str, sub: &str, msg_id: u64) -> bool {
 
 **请你动手**：补全三个方法，并特别理解 `ack`/`nack` 都只通过 `subscribers.get_mut(sub)` 定位到**单个订阅者**，不会碰其他订阅者的状态。
 
-**验证方式**：写一个临时测试：建 topic、注册 A、B 两个订阅者，发布 1 条，A `dequeue` 后 `nack`，此时应看到 A 的 `pending.len()==1`（重投回来了）而 B 的 `pending.len()==0`（没被 A 消费影响）——**这就是广播隔离效果**。
+**验证方式**：这次不用临时打印，直接把它写成**单元测试**（从本步起，我们开始穿插练习测试）：
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 广播隔离：A 的 nack 只会影响 A 自己，B 不受牵连
+    #[tokio::test]
+    async fn ack_nack_isolation() {
+        let mut b = Broker::new();
+        b.subscribe("orders", "A");
+        b.subscribe("orders", "B");
+        b.publish("orders", "测试消息".into());
+
+        let msg_a = b.dequeue("orders", "A").unwrap();
+        assert!(b.nack("orders", "A", msg_a.id));
+
+        // A 的消息被重投回 A 的 pending
+        let state_a = b.topics.get("orders").unwrap().subscribers.get("A").unwrap();
+        assert_eq!(state_a.pending.len(), 1);
+        assert!(state_a.inflight.is_empty());
+
+        // B 的 pending 仍是 1——那是广播复制给 B 自己的那份，A 的操作碰不到它
+        let state_b = b.topics.get("orders").unwrap().subscribers.get("B").unwrap();
+        assert_eq!(state_b.pending.len(), 1);
+        assert!(state_b.inflight.is_empty());
+    }
+}
+```
+
+> 运行 `cargo test`。能通过，就证明「**广播隔离效果**」成立——这也是你写的第一个 MQ 单元测试。之后的步骤会继续沿用这个习惯。
 
 ---
 
 ### 步骤六 超时重投巡检
+
+> ⏱ **建议耗时**：35–45 分钟
 
 **本步目标**：加一个后台任务，把「拉取了但超时没确认」的消息自动重投。
 
@@ -475,11 +526,41 @@ fn redeliver_timeout(&mut self, timeout: Duration) {
 
 **请你动手**：补全 `redeliver_timeout`，并思考：为什么巡检是「每个订阅者各自」做的？
 
-**验证方式**：暂无独立效果，`cargo build` 通过即可。真正的验证要到步骤七配合主流程一起看。
+**验证方式**：这次给你一个**不依赖步骤七**的独立验证——把「模拟超时」写进测试：手动把 `inflight` 里某条消息的投递时间改成 1 分钟前，再调用巡检，它就应该回到 `pending`：
+
+```rust
+#[tokio::test]
+async fn redeliver_expired_message() {
+    let mut b = Broker::new();
+    b.subscribe("orders", "A");
+    b.publish("orders", "超时消息".into());
+
+    // dequeue 后不 ack，模拟消费者卡死
+    let msg = b.dequeue("orders", "A").unwrap();
+    let s0 = b.topics.get("orders").unwrap().subscribers.get("A").unwrap();
+    assert_eq!(s0.pending.len(), 0);
+
+    // 关键技巧：把投递时间手动改成 60 秒前，模拟「超时未确认」
+    let state = b.topics.get_mut("orders").unwrap().subscribers.get_mut("A").unwrap();
+    if let Some((_, at)) = state.inflight.get_mut(&msg.id) {
+        *at = std::time::Instant::now() - std::time::Duration::from_secs(60);
+    }
+
+    // 用 1 秒的阈值巡检，应把这条消息重投回 pending
+    b.redeliver_timeout(std::time::Duration::from_secs(1));
+    let state = b.topics.get("orders").unwrap().subscribers.get("A").unwrap();
+    assert_eq!(state.pending.len(), 1);
+    assert!(state.inflight.is_empty());
+}
+```
+
+> 运行 `cargo test` 通过，超时重投逻辑就**独立验证完成**了，不必等步骤七。如果编译报错，多半是字段访问或借用问题，复习一下本步「先 collect 再删」的知识点。
 
 ---
 
 ### 步骤七 并发共享与主流程（成果展示）
+
+> ⏱ **建议耗时**：50–70 分钟
 
 **本步目标**：把所有零件组装起来——用 `Arc<Mutex<Broker>>` 共享状态，用 `Notify` 唤醒等待的订阅者，跑通完整的多订阅者并发 demo。
 
@@ -490,16 +571,20 @@ fn redeliver_timeout(&mut self, timeout: Duration) {
    - `Mutex` 保证同一时刻只有一个 task 能访问 broker（互斥）
    - `tokio::sync::Mutex` 是异步版本的 Mutex，适合在 `.await` 里持有
 
-2. **为什么用 `Notify`**：订阅者要在「队列没消息时」停下来等，而不是空转轮询浪费 CPU。`Notify` 让生产者发布消息时 `notify_one()` 唤醒一个等待中的订阅者。这叫做**条件变量**思想。
+2. **为什么用 `Notify`**：订阅者要在「队列没消息时」停下来等，而不是空转轮询浪费 CPU。`Notify` 让生产者发布消息时 `notify_waiters()` 唤醒所有等待中的订阅者（广播场景必须唤醒所有人，不能用 `notify_one`）。这叫做**条件变量**思想。
 
-> ⚠️ **一个微妙的坑**：`Notify` 的唤醒是「一次性」的。订阅者需要循环「检查有没有消息 → 没有就 `notified().await`」，否则可能错过通知（竞态）。文档已给出一个 `wait_for_message` 参考实现。
+> ⚠️ **一个微妙的坑**：`Notify` 的唤醒是「一次性」的，而且**不能锁着 `Mutex` 去 `await` 通知**——否则其他任务（发布者 / 巡检 / 统计）都拿不到锁，整个程序卡死。正确做法：把 `notifier` 存成 `Arc<Notify>`（步骤三已改好），先 `clone()` 出一个**不占锁的通知句柄**，然后按「先注册等待 → 再检查有没有消息 → 没有才 `await`」的顺序循环。下方 `wait_for_message` 参考实现就是标准写法。
 
 **实现提示**（这是最后一个、也是最综合的一步，给出较完整参考）：
 
 ```rust
 /// 消费者等待：直到指定订阅者有可拉取的消息
 async fn wait_for_message(broker: &Arc<tokio::sync::Mutex<Broker>>, topic: &str, sub: &str) {
+    // 先拿一个「通知句柄」：Arc<Notify> 不占锁，可以安全地带出锁作用域等待
+    let notify = broker.lock().await.notifier.clone();
     loop {
+        // 顺序很关键：先注册「我要等通知」，再检查有没有消息
+        let notified = notify.notified();
         {
             let b = broker.lock().await;
             let ready = b
@@ -511,8 +596,8 @@ async fn wait_for_message(broker: &Arc<tokio::sync::Mutex<Broker>>, topic: &str,
             if ready {
                 return;
             }
-        } // 锁在这里释放
-        broker.lock().await.notifier.notified().await;
+        } // 锁在这里释放，等待期间不占锁
+        notified.await; // 没有消息就睡，等生产者 notify_waiters 唤醒
     }
 }
 
@@ -620,6 +705,13 @@ async fn main() {
 4. 观察统计表：各订阅者的 `pending`/`inflight` **互不影响**
 
 > 如果一切正常，恭喜——你已经手动实现了「**广播订阅 + 每订阅者独立 ack + 超时重投**」的内存消息队列！
+
+**最终核对清单**：你的 `main.rs` 里应该已经具备这些零件，缺哪个就回去补：
+
+- 结构：`Message` / `SubscriberState`（`pending` + `inflight`）/ `Topic` / `Broker`（含 `notifier: Arc<Notify>`）
+- `Broker` 方法：`new` / `next_message_id` / `subscribe` / `publish` / `dequeue` / `ack` / `nack` / `redeliver_timeout` / `stats`
+- 函数：`wait_for_message` / `subscriber` / `redelivery_worker` + 组装好的 `main`
+- 测试：步骤五、六加的两个 `#[tokio::test]`（`cargo test` 应全绿）
 
 ---
 
