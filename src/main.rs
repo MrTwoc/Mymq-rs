@@ -83,6 +83,40 @@ impl Broker {
         self.next_id += 1;
         self.next_id
     }
+
+    fn dequeue(&mut self, topic: &str, sub: &str) -> Option<Message> {
+        let state = self.topics.get_mut(topic)?.subscribers.get_mut(sub)?;
+        let msg = state.pending.pop_front()?;
+        // 附带时间戳，记录消息发送时间
+        state.inflight.insert(msg.id, (msg.clone(), Instant::now()));
+        Some(msg)
+    }
+
+    fn ack(&mut self, topic: &str, sub: &str, msg_id: u64) -> bool {
+        match self
+            .topics
+            .get_mut(topic)
+            .and_then(|t| t.subscribers.get_mut(sub))
+        {
+            // 这里真的删除了消息，后续可以改为逻辑删除
+            Some(s) => s.inflight.remove(&msg_id).is_some(),
+            None => false,
+        }
+    }
+
+    fn nack(&mut self, topic: &str, sub: &str, msg_id: u64) -> bool {
+        if let Some(s) = self
+            .topics
+            .get_mut(topic)
+            .and_then(|t| t.subscribers.get_mut(sub))
+        {
+            if let Some((msg, _)) = s.inflight.remove(&msg_id) {
+                s.pending.push_back(msg);
+                return true;
+            }
+        }
+        false
+    }
 }
 #[tokio::main]
 async fn main() {
@@ -115,4 +149,42 @@ async fn main() {
         s1.pending.len(),
         s2.pending.len()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ack_nack_isolation() {
+        let mut b = Broker::new();
+        b.subscribe("orders", "A");
+        b.subscribe("orders", "B");
+        b.publish("orders", "测试消息".into());
+
+        let msg_a = b.dequeue("orders", "A").unwrap();
+        assert!(b.nack("orders", "A", msg_a.id));
+
+        // A 的消息被重投回 A 的 pending
+        let state_a = b
+            .topics
+            .get("orders")
+            .unwrap()
+            .subscribers
+            .get("A")
+            .unwrap();
+        assert_eq!(state_a.pending.len(), 1);
+        assert!(state_a.inflight.is_empty());
+
+        // B 的 pending 仍是 1——那是广播复制给 B 自己的那份，A 的操作碰不到它
+        let state_b = b
+            .topics
+            .get("orders")
+            .unwrap()
+            .subscribers
+            .get("B")
+            .unwrap();
+        assert_eq!(state_b.pending.len(), 1);
+        assert!(state_b.inflight.is_empty());
+    }
 }
