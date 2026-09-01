@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
@@ -117,6 +117,26 @@ impl Broker {
         }
         false
     }
+
+    /// 重投超时未确认的消息（对每个订阅者自己的 inflight 巡检）
+    /// 当前没有重试次数上限，会导致一直循环
+    fn redeliver_timeout(&mut self, timeout: Duration) {
+        for topic in self.topics.values_mut() {
+            for sub in topic.subscribers.values_mut() {
+                let expired: Vec<u64> = sub
+                    .inflight
+                    .iter()
+                    .filter(|(_, (_, at))| at.elapsed() > timeout)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for id in expired {
+                    if let Some((msg, _)) = sub.inflight.remove(&id) {
+                        sub.pending.push_back(msg);
+                    }
+                }
+            }
+        }
+    }
 }
 #[tokio::main]
 async fn main() {
@@ -162,6 +182,7 @@ mod tests {
         b.subscribe("orders", "B");
         b.publish("orders", "测试消息".into());
 
+        // A 消费消息，NACK
         let msg_a = b.dequeue("orders", "A").unwrap();
         assert!(b.nack("orders", "A", msg_a.id));
 
@@ -186,5 +207,45 @@ mod tests {
             .unwrap();
         assert_eq!(state_b.pending.len(), 1);
         assert!(state_b.inflight.is_empty());
+    }
+
+    #[tokio::test]
+    async fn redeliver_expired_message() {
+        let mut b = Broker::new();
+        b.subscribe("orders", "A");
+        b.publish("orders", "超时消息".into());
+
+        let msg = b.dequeue("orders", "A").unwrap();
+        let s0 = b
+            .topics
+            .get("orders")
+            .unwrap()
+            .subscribers
+            .get("A")
+            .unwrap();
+        assert_eq!(s0.pending.len(), 0);
+
+        let state = b
+            .topics
+            .get_mut("orders")
+            .unwrap()
+            .subscribers
+            .get_mut("A")
+            .unwrap();
+        if let Some((_, at)) = state.inflight.get_mut(&msg.id) {
+            *at = Instant::now() - Duration::from_secs(60);
+        }
+
+        b.redeliver_timeout(Duration::from_secs(1));
+
+        let state = b
+            .topics
+            .get("orders")
+            .unwrap()
+            .subscribers
+            .get("A")
+            .unwrap();
+        assert_eq!(state.pending.len(), 1);
+        assert!(state.inflight.is_empty());
     }
 }
