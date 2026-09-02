@@ -82,7 +82,7 @@ Mymq-rs/
 ## 路线图
 
 - [x] 内存版队列 demo
-- [ ] **阶段 1**：广播订阅 + ack + 超时重投（见 `LEARNING.md`）
+- [x] **阶段 1**：广播订阅 + ack + 超时重投（见 `LEARNING.md`）
 - [ ] **阶段 2**：QUIC + protobuf 网络化（见 `LEARNING-2-quic.md`）
 - [ ] **阶段 3**：持久化
 - [ ] **阶段 4**：topic 路由
