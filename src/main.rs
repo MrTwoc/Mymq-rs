@@ -1,9 +1,11 @@
+use core::time;
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
+    task,
     time::{Duration, Instant},
 };
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 
 /// 这里可以尝试使用 Arc 来共享消息，避免克隆消息
 #[derive(Clone)]
@@ -137,38 +139,122 @@ impl Broker {
             }
         }
     }
+
+    fn stats(&self) -> Vec<(String, String, usize, usize)> {
+        let mut out = Vec::new();
+        for (topic_name, topic) in &self.topics {
+            for (sub_name, sub_state) in &topic.subscribers {
+                out.push((
+                    topic_name.clone(),
+                    sub_name.clone(),
+                    sub_state.pending.len(),
+                    sub_state.inflight.len(),
+                ));
+            }
+        }
+        out
+    }
 }
+
+/// 等待消息
+async fn wati_for_message(broker: &Arc<Mutex<Broker>>, topic: &str, sub: &str) {
+    let notify = broker.lock().await.notifier.clone();
+    loop {
+        let notified = notify.notified();
+        {
+            let b = broker.lock().await;
+            let ready = b
+                .topics
+                .get(topic)
+                .and_then(|t| t.subscribers.get(sub))
+                .map(|s| !s.pending.is_empty())
+                .unwrap_or(false);
+            if ready {
+                return;
+            }
+        }
+        notified.await;
+    }
+}
+/// 订阅者
+async fn subscriber(broker: Arc<Mutex<Broker>>, topic: &str, name: &str, fail_rate: u32) {
+    loop {
+        wati_for_message(&broker, topic, name).await;
+        let msg = {
+            let mut b = broker.lock().await;
+            b.dequeue(topic, name)
+        };
+        if let Some(msg) = msg {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            // let success = (msg.id as u32) % 100 >= fail_rate;
+            let success = rand::random::<u32>() % 100 >= fail_rate;
+            let mut b = broker.lock().await;
+            if success {
+                b.ack(topic, name, msg.id);
+                println!("[{}] ✅ 处理成功: [{}] {}", name, msg.id, msg.body);
+            } else {
+                b.nack(topic, name, msg.id);
+                println!("[{}] 🔁 处理失败重投: [{}] {}", name, msg.id, msg.body);
+            }
+        }
+    }
+}
+
+/// 重投超时未确认的消息（对每个订阅者自己的 inflight 巡检）
+async fn redelivery_worker(broker: Arc<Mutex<Broker>>, timeout: Duration) {
+    loop {
+        tokio::time::sleep(timeout).await;
+        broker.lock().await.redeliver_timeout(timeout);
+    }
+}
+
 #[tokio::main]
 async fn main() {
-    let mut broker = Broker::new();
+    let broker = Arc::new(tokio::sync::Mutex::new(Broker::new()));
 
-    broker.subscribe("topic1", "sub1");
-    broker.subscribe("topic1", "sub2");
+    {
+        let mut b = broker.lock().await;
+        b.subscribe("orders", "订单推送");
+        b.subscribe("orders", "库存扣减");
+        b.subscribe("orders", "报表分析");
+    }
 
-    let id = broker.publish("topic1", "hello".to_string());
+    {
+        let mut b = broker.lock().await;
+        b.publish("orders", "事件：新订单 001".into());
+        b.publish("orders", "事件：新订单 002".into());
+        b.publish("orders", "事件：新订单 003".into());
+        b.publish("orders", "事件：新订单 004".into());
+    }
+    println!("=== 已发布 4 条事件，广播给 3 个订阅者 ===");
 
-    // publish 结束，&mut 借用已释放，可以重新拿引用读取 len
-    let s1 = broker
-        .topics
-        .get("topic1")
-        .unwrap()
-        .subscribers
-        .get("sub1")
-        .unwrap();
-    let s2 = broker
-        .topics
-        .get("topic1")
-        .unwrap()
-        .subscribers
-        .get("sub2")
-        .unwrap();
+    let mut tasks = Vec::new();
+    for name in ["订单推送", "库存扣减", "报表分析"] {
+        let b = Arc::clone(&broker);
+        tasks.push(tokio::spawn(subscriber(b, "orders", name, 30)));
+    }
 
-    println!(
-        "发布了消息 id = {}, sub1 pending len = {}, sub2 pending len = {}",
-        id,
-        s1.pending.len(),
-        s2.pending.len()
-    );
+    let b = Arc::clone(&broker);
+    tasks.push(tokio::spawn(redelivery_worker(b, Duration::from_secs(2))));
+
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let b = broker.lock().await;
+        println!("\n=== 当前订阅者状态 ===");
+        for (t, s, pending, inflight) in b.stats() {
+            println!(
+                "topic[{}] 订阅者[{}]: 待投递={} 待确认={}",
+                t, s, pending, inflight
+            );
+        }
+    }
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    for t in tasks {
+        t.abort();
+    }
+
+    println!("\n=== 演示结束 ===");
 }
 
 #[cfg(test)]
