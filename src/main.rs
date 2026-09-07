@@ -10,18 +10,24 @@ use tokio::sync::{Mutex, mpsc};
 /// 这里可以尝试使用 Arc 来共享消息，避免克隆消息
 #[derive(Clone)]
 struct Message {
+    // 消息ID
     id: u64,
+    // 消息体
     body: String,
 }
 
-struct Subscriber_State {
+/// 订阅者状态
+struct SubscriberState {
+    // 待处理消息队列，为什么是VecDeque？因为消息是按顺序到达的，所以需要从队头出队
+    // 保序用VecDeque
     pending: VecDeque<Message>,
+    // 发送中的消息队列，为什么是HashMap？ack是乱序到达，所以需要根据消息ID来查找
     inflight: HashMap<u64, (Message, Instant)>,
 }
 
-impl Subscriber_State {
+impl SubscriberState {
     fn new() -> Self {
-        Subscriber_State {
+        SubscriberState {
             pending: VecDeque::new(),
             inflight: HashMap::new(),
         }
@@ -29,7 +35,7 @@ impl Subscriber_State {
 }
 
 struct Topic {
-    subscribers: HashMap<String, Subscriber_State>,
+    subscribers: HashMap<String, SubscriberState>,
 }
 impl Topic {
     fn new() -> Self {
@@ -38,8 +44,8 @@ impl Topic {
         }
     }
 }
+///
 struct Broker {
-    // queues: HashMap<String, mpsc::Sender<String>>,
     topics: HashMap<String, Topic>,
     next_id: u64,
     notifier: Arc<tokio::sync::Notify>,
@@ -49,16 +55,10 @@ impl Broker {
     fn new() -> Self {
         Broker {
             topics: HashMap::new(),
-            next_id: 1,
+            next_id: 0,
             notifier: Arc::new(tokio::sync::Notify::new()),
         }
     }
-
-    // fn create_queue(&mut self, name: &str) -> mpsc::Receiver<String> {
-    //     let (tx, rx) = mpsc::channel(1024);
-    //     self.queues.insert(name.to_string(), tx);
-    //     rx
-    // }
 
     fn publish(&mut self, topic: &str, body: String) -> u64 {
         let id = self.next_message_id();
@@ -72,13 +72,13 @@ impl Broker {
         id
     }
 
-    fn subscribe(&mut self, topic: &str, subscriber: &str) -> &mut Subscriber_State {
+    fn subscribe(&mut self, topic: &str, subscriber: &str) -> &mut SubscriberState {
         self.topics
             .entry(topic.to_string())
             .or_insert_with(Topic::new)
             .subscribers
             .entry(subscriber.to_string())
-            .or_insert(Subscriber_State::new())
+            .or_insert(SubscriberState::new())
     }
 
     fn next_message_id(&mut self) -> u64 {
