@@ -1,0 +1,52 @@
+// proto/mq.proto
+syntax = "proto3";
+
+package mq;
+
+// 一条消息
+message Message {
+  uint64 id = 1;
+  string body = 2;
+}
+
+// 客户端发来的命令
+message Command {
+  oneof cmd {
+    Subscribe subscribe = 1;
+    Publish publish = 2;
+    Dequeue dequeue = 3;
+    Ack ack = 4;
+    Nack nack = 5;
+  }
+
+  message Subscribe {
+    string topic = 1;
+    string subscriber = 2;
+  }
+  message Publish {
+    string topic = 1;
+    string body = 2;
+  }
+  message Dequeue {
+    string topic = 1;
+    string subscriber = 2;
+  }
+  message Ack {
+    string topic = 1;
+    string subscriber = 2;
+    uint64 msg_id = 3;
+  }
+  message Nack {
+    string topic = 1;
+    string subscriber = 2;
+    uint64 msg_id = 3;
+  }
+}
+
+// 服务端返回的响应
+message Response {
+  bool ok = 1;                       // 命令是否成功
+  uint64 msg_id = 2;                 // PUBLISH/DEQUEUE 返回的消息 id
+  Message message = 3;               // DEQUEUE 返回的消息体（无消息时为空）
+  string error = 4;                  // 失败时的错误信息
+}
