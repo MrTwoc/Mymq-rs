@@ -318,7 +318,7 @@ use tokio::sync::Mutex;
 use mymq::broker::Broker;
 
 async fn handle_conn(stream: TcpStream, broker: Arc<Mutex<Broker>>) -> anyhow::Result<()> {
-    let (read_half, mut write_half) = stream.split();
+    let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
 
