@@ -7,7 +7,7 @@ fn main() -> anyhow::Result<()> {
     let mut params = CertificateParams::default();
 
     params.subject_alt_names = vec![
-        //
+        // 这里不能用.into, rcgen 官方文档的推荐写法是 try_into
         SanType::DnsName("localhost".try_into()?),
         SanType::IpAddress("127.0.0.1".parse()?),
     ];

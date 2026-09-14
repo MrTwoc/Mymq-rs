@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 
 /// 等待消息
-async fn wati_for_message(broker: &Arc<Mutex<Broker>>, topic: &str, sub: &str) {
+async fn wait_for_message(broker: &Arc<Mutex<Broker>>, topic: &str, sub: &str) {
     let notify = broker.lock().await.notifier.clone();
     loop {
         let notified = notify.notified();
@@ -25,7 +25,7 @@ async fn wati_for_message(broker: &Arc<Mutex<Broker>>, topic: &str, sub: &str) {
 /// 订阅者
 async fn subscriber(broker: Arc<Mutex<Broker>>, topic: &str, name: &str, fail_rate: u32) {
     loop {
-        wati_for_message(&broker, topic, name).await;
+        wait_for_message(&broker, topic, name).await;
         let msg = {
             let mut b = broker.lock().await;
             b.dequeue(topic, name)

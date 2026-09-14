@@ -61,7 +61,7 @@
 | 4 | 编辑版本 | 看 `Cargo.toml` 的 `edition` | `"2024"` |
 | 5 | `SubscriberState` 字段 | 打开 `broker.rs` | `pending: VecDeque<Message>`、`inflight: HashMap<u64, (Message, Instant)>` |
 
-> ⚠️ **路径提醒**：本册所有代码里，库名一律写 **`mymq_rs`**（不是 `mymq`）。`LEARNING-2-quic.md` 里为了简短用的是 `mymq`，那份文档的 `use mymq::...` **照抄会编译失败**，请以本册和你的 `Cargo.toml` 为准。
+> ⚠️ **路径提醒**：本册所有代码里，库名一律写 **`mymq_rs`**，对应 `Cargo.toml` 里的 `[lib] name = "mymq_rs"`。`LEARNING-2-quic.md` 已与本册保持一致（那份文档的早期版本曾写作 `mymq`，现已修正）。
 
 ### 0.2 本册在路线图中的位置
 
@@ -688,6 +688,9 @@ impl Broker {
     pub fn with_max_retries(max_retries: u32) -> Self {
         Broker {
             topics: HashMap::new(),
+            // 初值 0 + 「先自增再返回」⇒ 首条 id = 1；
+            // 不要和 LEARNING.md 的「初值 1 + 先返回再自增」混用，否则首条 id 会变成 0
+            // （0 在 proto3 里是默认值，会被当成「没有消息」的隐式哨兵）
             next_id: 0,
             notifier: Arc::new(tokio::sync::Notify::new()),
             max_retries,
@@ -724,7 +727,7 @@ pub fn dequeue(&mut self, topic: &str, sub: &str) -> Option<Message> {
 
 **验证方式**：
 
-在 `broker.rs` 末尾的 `#[cfg(test)] mod tests` 里加一个测试，直接检查 `inflight` 里的 `attempts`：
+在 `src/main.rs` 末尾的 `#[cfg(test)] mod tests` 里加一个测试（**现有两个测试就在这个文件里**，`broker.rs` 目前还没有测试模块），直接检查 `inflight` 里的 `attempts`：
 
 ```rust
 #[tokio::test]

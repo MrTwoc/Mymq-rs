@@ -78,6 +78,7 @@ async fn main() {
 ```toml
 [dependencies]
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+rand = "0.10.2"   # 步骤七的订阅者用 rand::random 模拟随机失败率
 # 注：步骤七用到了 tokio::time::sleep，因此需要 "time" 特性
 ```
 
@@ -216,7 +217,7 @@ struct Broker {
 }
 ```
 
-`new()` 里把它初始化为 `1`。
+`new()` 里把它初始化为 `1`。**自增方向说明**：本册约定 `next_message_id` 是「先返回当前值、再自增」，所以首条消息的 id 正好是 1。阶段 2.5 会把它改成「初值 `0` + 先自增再返回」，两者首条 id 都是 1——**但只能选一种，不要混用**（混用会让首条 id 变成 `0`，而 `0` 在 protobuf 里是默认值，会被当成「没有消息」）。
 
 **请你动手**：写一个方法 `Broker::next_message_id(&mut self) -> u64`，每次返回当前值并自增。
 
@@ -616,7 +617,8 @@ async fn subscriber(
         };
         if let Some(msg) = msg {
             tokio::time::sleep(std::time::Duration::from_millis(80)).await; // 模拟处理耗时
-            let success = (msg.id as u32) % 100 >= fail_rate;
+            // 用 rand 产生真随机失败，便于观察重投/重试（仓库里的 main.rs 就是这个版本）
+            let success = rand::random::<u32>() % 100 >= fail_rate;
             let mut b = broker.lock().await;
             if success {
                 b.ack(topic, name, msg.id);

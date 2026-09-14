@@ -249,7 +249,7 @@ message Response {
 | `tokio` | 异步运行时（已有，需补 feature） | `[dependencies]` |
 | `anyhow` / `bytes` | 错误简化 / 缓冲（可选但推荐） | `[dependencies]` |
 
-> 📖 **为什么项目要从「单 main.rs」变成「库 + 多个可执行文件」**？因为我们要有 `server`、`client`、`gen_cert`、`tcp_server` 等多个程序，而它们都要引用同一个 `Broker`。把 `Broker` 放进库（`lib.rs`），所有 bin 都能 `use mymq::broker::Broker;`，这是 Rust 多程序工程的标准布局。
+> 📖 **为什么项目要从「单 main.rs」变成「库 + 多个可执行文件」**？因为我们要有 `server`、`client`、`gen_cert`、`tcp_server` 等多个程序，而它们都要引用同一个 `Broker`。把 `Broker` 放进库（`lib.rs`），所有 bin 都能 `use mymq_rs::broker::Broker;`，这是 Rust 多程序工程的标准布局。
 
 **实现提示**：编辑 `Cargo.toml`：
 
@@ -257,6 +257,7 @@ message Response {
 [dependencies]
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time"] }
 # 注意：比 LEARNING.md 多了 "net" 和 "io-util"（步骤二 TCP 用）、"time"（LEARNING.md 步骤七就已需要）
+rand = "0.10.2"        # 阶段 1 的 main.rs 演示用（随机失败率），本阶段仍然需要
 quinn = "0.11"
 prost = "0.13"
 rcgen = "0.13"
@@ -267,7 +268,7 @@ bytes = "1"           # quinn 流读写用 Bytes 缓冲（quinn 依赖它，方�
 prost-build = "0.13"
 
 [lib]
-name = "mymq"         # 库名设为简短的 mymq，bin 里 use mymq::broker::Broker;
+name = "mymq_rs"      # 库名设为简短的 mymq_rs，bin 里 use mymq_rs::broker::Broker;
 ```
 
 > ⚠️ **版本提示**：quinn / prost / rcgen 的版本号请以**你执行 `cargo add` 时的最新版本为准**。上面是示例。建议直接在项目根目录运行：
@@ -282,7 +283,7 @@ name = "mymq"         # 库名设为简短的 mymq，bin 里 use mymq::broker::B
 1. 新建 `src/lib.rs`，内容：`pub mod broker;`（步骤三做完后还会加一行 `pub mod proto;`）——这是库入口
 2. 把你在 `LEARNING.md` 中实现的 `Broker` 及相关结构（`Message`/`Topic`/`SubscriberState`）整体移动到新文件 `src/broker.rs`
 3. 给所有类型和方法加 `pub`（`pub struct Broker`、`pub fn ...`），**`Message` 的 `id`/`body` 字段也要 `pub`**（网络层要读它们）
-4. `src/main.rs` 顶部改为 `use mymq::broker::Broker;`，删掉原来重复的结构定义；`main.rs` 里的 `wait_for_message` / `subscriber` / `redelivery_worker` 等 demo 函数可以保留
+4. `src/main.rs` 顶部改为 `use mymq_rs::broker::Broker;`，删掉原来重复的结构定义；`main.rs` 里的 `wait_for_message` / `subscriber` / `redelivery_worker` 等 demo 函数可以保留
 
 **请你动手**：
 1. 运行上面的 `cargo add` 命令，并按提示手动补 `tokio` feature 和 `[lib] name`
@@ -315,7 +316,7 @@ use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
-use mymq::broker::Broker;
+use mymq_rs::broker::Broker;
 
 async fn handle_conn(stream: TcpStream, broker: Arc<Mutex<Broker>>) -> anyhow::Result<()> {
     let (read_half, mut write_half) = stream.into_split();
@@ -416,6 +417,17 @@ async fn main() -> anyhow::Result<()> {
 6. 开第二个订阅者 `SUBSCRIBE orders 库存组`，再 PUBLISH 一条，两个订阅者各自 `DEQUEUE`——**都能拿到同一条消息，广播在网络上也成立**
 
 > 跑通这步后，你已经掌握「字节流帧边界 + 命令分发 + 共享 broker」三件事。接下来 QUIC 只是把「行协议 + TCP」换成「protobuf + stream」，思维模型完全不变。这个过渡版本的代码跑通后可以留着对比，也可以删掉。
+
+**已知缺陷（留给你自己修）**：上面那份参考实现里埋着一个和参数校验有关的坑。先别急着往下走，用三小步自己把它挖出来：
+
+1. **制造现象**——起好服务端后，故意少传一个参数发一条 `ACK`：`cargo run --bin tcp_client -- ACK orders 推送组`
+2. **观察**——客户端打印出什么了？服务端那个终端里有没有 `panicked at ...` 之类的输出？
+3. **追问三个问题**：
+   - `if parts.len() < 3 { ... }` 这个校验做在命令分发**之前**，它约束的到底是「本条命令真正需要的参数个数」，还是「所有命令的一个通用下界」？
+   - `ACK` / `NACK` 分支里用到了 `parts[2]`，还用到了 `parts[3]`；当 `parts.len() == 3` 时，`parts[3]` 会怎样？
+   - `ERR need more args` 这句提示，对参数个数不是 3 的命令（有哪些？）来说，说得准吗？
+
+三个问题想清楚，改法自然就出来了——校验放在哪一层、按什么粒度做，由你定。改完记得把上面这份参考实现也同步成你的版本，别让文档和代码对不上。
 
 ---
 
@@ -548,7 +560,7 @@ pub fn handle_command(&mut self, cmd: mq::Command) -> mq::Response {
 
 **请你动手**：给 `Broker` 加 `handle_command` 方法，完成 5 种命令的翻译。思考：`dequeue` 返回空时，怎么在 `Response` 里表达「没消息」而不是「出错」？
 
-**验证方式**：`cargo check` 通过。可以写一个单元测试：构造一个 `Publish` 命令，调用 `handle_command`，检查返回的 `msg_id > 0`。把测试加在 `src/broker.rs` 末尾的 `#[cfg(test)] mod tests` 里，运行 `cargo test`。
+**验证方式**：`cargo check` 通过。可以写一个单元测试：构造一个 `Publish` 命令，调用 `handle_command`，检查返回的 `msg_id > 0`。把测试加在 `src/main.rs` 末尾的 `#[cfg(test)] mod tests` 里（现有测试都在那里，`broker.rs` 还没有测试模块），运行 `cargo test`。
 
 ---
 
@@ -589,8 +601,8 @@ flowchart TD
 use std::sync::Arc;
 use quinn::{Endpoint, ServerConfig, TransportConfig};
 use tokio::sync::Mutex;
-use mymq::proto::mq;
-use mymq::broker::Broker;
+use mymq_rs::proto::mq;
+use mymq_rs::broker::Broker;
 
 /// 读取本地生成的证书文件，构造 TLS 配置所需的类型
 fn load_cert() -> anyhow::Result<(
@@ -685,7 +697,7 @@ quinn 客户端流程（与 TCP connect 对称，但**必须配置证书信任**
 ```rust
 use std::sync::Arc;
 use quinn::{ClientConfig, Endpoint};
-use mymq::proto::mq;
+use mymq_rs::proto::mq;
 
 /// 信任我们自签的证书（仅本地学习；生产环境应由可信 CA 签发）
 fn client_config() -> anyhow::Result<quinn::ClientConfig> {
@@ -727,7 +739,7 @@ match args[1].as_str() {
 }
 ```
 
-> 📖 **模块路径**：因为 `lib.rs` 里声明了 `pub mod broker; pub mod proto;`，而 `proto.rs` 里是 `pub mod mq { include!(...) }`，所以完整类型路径是 `mymq::proto::mq::Command`。bin 文件顶部 `use mymq::proto::mq;` 后即可直接用 `mq::Command`。
+> 📖 **模块路径**：因为 `lib.rs` 里声明了 `pub mod broker; pub mod proto;`，而 `proto.rs` 里是 `pub mod mq { include!(...) }`，所以完整类型路径是 `mymq_rs::proto::mq::Command`。bin 文件顶部 `use mymq_rs::proto::mq;` 后即可直接用 `mq::Command`。
 
 **请你动手**：创建 `src/bin/client.rs`，实现 `client_config`、`send_command` 和基于命令行参数的命令分发。构造 `Command` 的 oneof 赋值方式形如：
 
@@ -843,7 +855,7 @@ flowchart LR
 
 ```text
 Mymq-rs/
-├── Cargo.toml            # 含 [lib] name = "mymq"
+├── Cargo.toml            # 含 [lib] name = "mymq_rs"
 ├── build.rs              # prost 代码生成
 ├── proto/
 │   └── mq.proto          # 协议定义（唯一真相）
@@ -888,7 +900,7 @@ cargo add quinn prost rcgen anyhow bytes
 cargo add --build prost-build
 ```
 
-> 别忘了手动补：`tokio` 的 `net` / `io-util` / `time` features，以及 `[lib] name = "mymq"`。
+> 别忘了手动补：`tokio` 的 `net` / `io-util` / `time` features，以及 `[lib] name = "mymq_rs"`。
 
 ### 证书命令
 

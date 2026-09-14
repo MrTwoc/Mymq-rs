@@ -81,6 +81,8 @@ impl Broker {
             .or_insert(SubscriberState::new())
     }
 
+    /// 先自增、再返回 ⇒ `next_id` 初值为 0 时，首条消息 id = 1。
+    /// 永远不会发出 id = 0，避免与 proto3 中 `uint64` 的默认值（0）撞车。
     fn next_message_id(&mut self) -> u64 {
         self.next_id += 1;
         self.next_id
