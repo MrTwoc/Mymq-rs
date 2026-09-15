@@ -4,6 +4,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::proto::mq::{self, Response};
+
 /// 这里可以尝试使用 Arc 来共享消息，避免克隆消息
 #[derive(Clone)]
 pub struct Message {
@@ -159,5 +161,72 @@ impl Broker {
             }
         }
         out
+    }
+
+    pub fn handle_command(&mut self, cmd: mq::Command) -> mq::Response {
+        use mq::command::Cmd;
+        match cmd.cmd {
+            Some(Cmd::Subscribe(s)) => {
+                self.subscribe(&s.topic, &s.subscriber);
+                Response {
+                    ok: true,
+                    ..Default::default()
+                }
+            }
+            Some(Cmd::Publish(p)) => {
+                let msg_id = self.publish(&p.topic, p.body);
+                Response {
+                    ok: true,
+                    msg_id,
+                    ..Default::default()
+                }
+            }
+            Some(Cmd::Dequeue(d)) => match self.dequeue(&d.topic, &d.subscriber) {
+                Some(msg) => Response {
+                    ok: true,
+                    msg_id: msg.id,
+                    message: Some(mq::Message {
+                        id: msg.id,
+                        body: msg.body,
+                    }),
+                    ..Default::default()
+                },
+                None => Response {
+                    ok: false,
+                    ..Default::default()
+                },
+            },
+            Some(Cmd::Ack(a)) => {
+                let ok = self.ack(&a.topic, &a.subscriber, a.msg_id);
+                Response {
+                    ok,
+                    error: if ok {
+                        String::new()
+                    } else {
+                        "消息不存在或已被确认".into()
+                    },
+                    ..Default::default()
+                }
+            }
+            Some(Cmd::Nack(n)) => {
+                let ok = self.nack(&n.topic, &n.subscriber, n.msg_id);
+                Response {
+                    ok,
+                    msg_id: n.msg_id,
+                    message: None,
+                    error: if ok {
+                        String::new()
+                    } else {
+                        "消息不存在或已被确认".into()
+                    },
+                    ..Default::default()
+                }
+            }
+            None => Response {
+                ok: false,
+                error: "未知命令".into(),
+                ..Default::default()
+            },
+        }
     }
 }
