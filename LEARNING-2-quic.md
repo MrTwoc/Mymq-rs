@@ -639,7 +639,7 @@ async fn handle_stream(
 ```rust
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let (cert, key) = load_cert();        // 读 cert.der / key.der
+    let (cert, key) = load_cert()?;        // 读 cert.der / key.der
     let mut server_config = quinn::ServerConfig::with_single_cert(cert, key)?;
     let transport = Arc::new(TransportConfig::default());
     server_config.transport = transport;
