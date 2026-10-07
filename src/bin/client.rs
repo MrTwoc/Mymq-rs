@@ -109,6 +109,8 @@ async fn main() -> anyhow::Result<()> {
         other => anyhow::bail!("未知命令\n{USAGE}"),
     };
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse()?)?;
+    // 这一段是添加的，用于配置客户端的 TLS 验证
+    endpoint.set_default_client_config(client_config()?);
     let conn = endpoint.connect(SERVER_ADDR.parse()?, SERVER_NAME)?.await?;
 
     let resp = send_command(&conn, cmd).await?;
